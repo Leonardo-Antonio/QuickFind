@@ -4,7 +4,7 @@ DATADIR = $(PREFIX)/share
 APPDIR = $(DATADIR)/applications
 
 BINARY = target/release/quickfind
-FEATURES ?= 
+FEATURES ?=
 
 .PHONY: all build install uninstall clean
 

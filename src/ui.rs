@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::clipboard::ClipItem;
 use crate::config::Config;
 use crate::launcher::{AppLauncher, DesktopEntry};
 
@@ -138,6 +139,50 @@ window.quickfind-window {
     padding: 32px 8px;
 }
 
+.ts-hint {
+    color: rgba(255, 255, 255, 0.35);
+    font-size: 12px;
+    font-weight: 450;
+    padding: 4px 14px 6px 14px;
+}
+
+.ts-tag {
+    color: #4a9d9d;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+}
+
+.result-row.selected .ts-tag {
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.ts-value {
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 17px;
+    font-weight: 400;
+}
+
+.calc-row {
+    background: transparent;
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin: 1px 0;
+}
+
+.calc-result {
+    color: #ffffff;
+    font-size: 26px;
+    font-weight: 300;
+    letter-spacing: 0.3px;
+}
+
+.calc-hint {
+    color: rgba(255, 255, 255, 0.3);
+    font-size: 13px;
+    font-weight: 450;
+}
+
 .web-search-row {
     background: transparent;
     border-radius: 10px;
@@ -164,10 +209,15 @@ pub struct QuickFindWindow {
 }
 
 impl QuickFindWindow {
-    pub fn new(app: &gtk::Application, config: Arc<Config>, launcher: Arc<AppLauncher>) -> Self {
+    pub fn new(
+        app: &gtk::Application,
+        config: Arc<Config>,
+        launcher: Arc<AppLauncher>,
+        initial_query: Option<String>,
+    ) -> Self {
         let provider = gtk::CssProvider::new();
         provider.load_from_string(CSS);
-        
+
         if let Some(display) = gdk::Display::default() {
             gtk::style_context_add_provider_for_display(
                 &display,
@@ -202,7 +252,7 @@ impl QuickFindWindow {
             .vexpand(false)
             .css_classes(vec!["scrolled-window".to_string(), "results-area".to_string()])
             .propagate_natural_height(true)
-            .max_content_height(360)
+            .max_content_height(420)
             .build();
         // Oculto al inicio: la ventana es solo la barra de búsqueda.
         scrolled.set_visible(false);
@@ -223,9 +273,16 @@ impl QuickFindWindow {
         let result_rows: Rc<RefCell<Vec<gtk::Box>>> = Rc::new(RefCell::new(Vec::new()));
         let web_row: Rc<RefCell<Option<gtk::Box>>> = Rc::new(RefCell::new(None));
         let current_query: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let current_calc: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let clip_items: Rc<RefCell<Vec<ClipItem>>> = Rc::new(RefCell::new(Vec::new()));
+        // Valores copiables de las filas de timestamp (UTC, local).
+        let ts_values: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
         let results_box_clone = results_box.clone();
         let scrolled_clone = scrolled.clone();
+        let calc_clone = current_calc.clone();
+        let clip_clone = clip_items.clone();
+        let ts_clone = ts_values.clone();
         let results_clone = results.clone();
         let selected_clone = selected_index.clone();
         let rows_clone = result_rows.clone();
@@ -237,7 +294,48 @@ impl QuickFindWindow {
         search_entry.connect_changed(move |entry| {
             let text = entry.text().to_string();
             *query_clone.borrow_mut() = text.clone();
-            let new_results = if text.is_empty() {
+
+            // Palabras clave que activan el historial del portapapeles.
+            const CLIP_KEYWORDS: [&str; 3] = [":clipboard", ":cbhistory", ":cb"];
+            let trimmed = text.trim();
+            // Los comandos empiezan con ":" → altura máxima fija (sin medir).
+            let is_command = trimmed.starts_with(':');
+            let is_empty = trimmed.is_empty();
+            let lower = trimmed.to_lowercase();
+            let clip_keyword = CLIP_KEYWORDS.iter().find(|kw| {
+                lower == **kw || lower.starts_with(&format!("{} ", kw))
+            });
+
+            // Modo historial del portapapeles: ":cb [filtro]".
+            let clips = if let Some(kw) = clip_keyword {
+                let filter = trimmed[kw.len()..].trim();
+                Some(crate::clipboard::history(25, filter))
+            } else {
+                None
+            };
+            let clip_mode = clips.is_some();
+
+            // Conversión de timestamp: ":timestamp <n>" o ":tsp <n>".
+            const TS_KEYWORDS: [&str; 2] = [":timestamp", ":tsp"];
+            let ts_keyword = if clip_mode {
+                None
+            } else {
+                TS_KEYWORDS
+                    .iter()
+                    .find(|kw| lower == **kw || lower.starts_with(&format!("{} ", kw)))
+            };
+            let ts_active = ts_keyword.is_some();
+            let ts = ts_keyword.and_then(|kw| crate::timestamp::convert(trimmed[kw.len()..].trim()));
+
+            // ¿Es una operación matemática? Si lo es, mostramos el resultado.
+            let calc = if clip_mode || ts_active {
+                None
+            } else {
+                crate::calc::evaluate(&text).map(crate::calc::format_result)
+            };
+            *calc_clone.borrow_mut() = calc.clone();
+
+            let new_results = if text.is_empty() || calc.is_some() || clip_mode || ts_active {
                 Vec::new()
             } else {
                 launcher_clone.search(&text, config_clone.max_results)
@@ -247,18 +345,45 @@ impl QuickFindWindow {
             };
 
             *results_clone.borrow_mut() = new_results;
+            *clip_clone.borrow_mut() = clips.clone().unwrap_or_default();
+            *ts_clone.borrow_mut() = ts
+                .as_ref()
+                .map(|r| vec![r.utc.clone(), r.local.clone()])
+                .unwrap_or_default();
             *selected_clone.borrow_mut() = 0;
             Self::update_results_ui(
                 &results_box_clone,
                 &scrolled_clone,
                 &results_clone.borrow(),
                 text,
+                calc.as_deref(),
+                clips.as_deref(),
+                ts.as_ref(),
+                ts_active,
                 &rows_clone,
                 &web_row_clone,
                 *selected_clone.borrow(),
                 config_clone.show_icons,
                 config_clone.icon_size,
             );
+            // Ajuste de altura del área de resultados.
+            if is_empty {
+                // Input vacío: volvemos al estado inicial (solo la barra).
+                scrolled_clone.set_min_content_height(0);
+                scrolled_clone.set_max_content_height(420);
+            } else if is_command {
+                // Comandos (":cb", ":tsp", ...): altura máxima fija, sin medir.
+                scrolled_clone.set_min_content_height(420);
+                scrolled_clone.set_max_content_height(420);
+            } else if scrolled_clone.is_visible() {
+                // Búsqueda normal: la altura sigue al contenido. Diferido a un
+                // idle para medir cuando el layout ya está estable.
+                let s = scrolled_clone.clone();
+                let c = results_box_clone.clone();
+                glib::idle_add_local_once(move || {
+                    Self::fit_scrolled(&s, &c);
+                });
+            }
         });
 
         let win_key = window.clone();
@@ -268,6 +393,11 @@ impl QuickFindWindow {
         let rows_key = result_rows.clone();
         let launcher_key = launcher.clone();
         let query_key = current_query.clone();
+        let calc_key = current_calc.clone();
+        let clip_key = clip_items.clone();
+        let ts_key = ts_values.clone();
+        let win_calc = window.clone();
+        let scrolled_key = scrolled.clone();
 
         let event_controller = gtk::EventControllerKey::new();
         // Capture: interceptamos teclas (Enter, flechas) antes de que el
@@ -291,6 +421,40 @@ impl QuickFindWindow {
                     glib::Propagation::Stop
                 }
                 gdk::Key::Return | gdk::Key::KP_Enter => {
+                    // Si hay un resultado de cálculo, Enter lo copia al portapapeles.
+                    if let Some(result) = calc_key.borrow().clone() {
+                        if let Some(display) = gdk::Display::default() {
+                            display.clipboard().set_text(&result);
+                        }
+                        win_calc.close();
+                        return glib::Propagation::Stop;
+                    }
+                    // Modo timestamp: Enter copia la fecha seleccionada (UTC/local).
+                    {
+                        let values = ts_key.borrow();
+                        if !values.is_empty() {
+                            let idx = *selected_key.borrow();
+                            if let Some(value) = values.get(idx) {
+                                if let Some(display) = gdk::Display::default() {
+                                    display.clipboard().set_text(value);
+                                }
+                                win_calc.close();
+                            }
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    // Modo clipboard: Enter copia el registro seleccionado.
+                    {
+                        let clips = clip_key.borrow();
+                        if !clips.is_empty() {
+                            let idx = *selected_key.borrow();
+                            if let Some(item) = clips.get(idx) {
+                                let _ = crate::clipboard::copy_to_clipboard(item);
+                                win_calc.close();
+                            }
+                            return glib::Propagation::Stop;
+                        }
+                    }
                     let idx = *selected_key.borrow();
                     let results = results_key.borrow();
                     if let Some(entry) = results.get(idx) {
@@ -306,17 +470,17 @@ impl QuickFindWindow {
                     if *idx > 0 {
                         *idx -= 1;
                     }
-                    Self::update_selection(&rows_key, *idx);
+                    Self::update_selection(&rows_key, *idx, &scrolled_key);
                     glib::Propagation::Stop
                 }
                 gdk::Key::Down => {
                     let mut idx = selected_key.borrow_mut();
-                    let app_count = results_key.borrow().len();
-                    let max_idx = app_count.saturating_sub(1);
+                    // Las filas navegables (apps o clipboard) están en rows_key.
+                    let max_idx = rows_key.borrow().len().saturating_sub(1);
                     if *idx < max_idx {
                         *idx += 1;
                     }
-                    Self::update_selection(&rows_key, *idx);
+                    Self::update_selection(&rows_key, *idx, &scrolled_key);
                     glib::Propagation::Stop
                 }
                 gdk::Key::r if ctrl => {
@@ -339,6 +503,30 @@ impl QuickFindWindow {
                         gdk::Key::_9 => 8,
                         _ => 0,
                     };
+                    // En modo timestamp, Ctrl+N copia la fecha N (UTC/local).
+                    {
+                        let values = ts_key.borrow();
+                        if !values.is_empty() {
+                            if let Some(value) = values.get(digit) {
+                                if let Some(display) = gdk::Display::default() {
+                                    display.clipboard().set_text(value);
+                                }
+                                win_key.close();
+                            }
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    // En modo clipboard, Ctrl+N copia el registro N.
+                    {
+                        let clips = clip_key.borrow();
+                        if !clips.is_empty() {
+                            if let Some(item) = clips.get(digit) {
+                                let _ = crate::clipboard::copy_to_clipboard(item);
+                                win_key.close();
+                            }
+                            return glib::Propagation::Stop;
+                        }
+                    }
                     let results = results_key.borrow();
                     if let Some(entry) = results.get(digit) {
                         if let Err(e) = AppLauncher::launch(entry) {
@@ -354,8 +542,14 @@ impl QuickFindWindow {
 
         window.add_controller(event_controller);
 
+        // Consulta inicial desde la línea de comandos (-q): rellena y filtra.
+        if let Some(query) = initial_query.filter(|q| !q.is_empty()) {
+            search_entry.set_text(&query);
+            search_entry.set_position(-1); // cursor al final
+        }
+
         search_entry.grab_focus();
-        
+
         if let Some(display) = gdk::Display::default() {
             if let Some(surface) = window.surface() {
                 let monitor = display.monitor_at_surface(&surface)
@@ -373,28 +567,43 @@ impl QuickFindWindow {
         self.search_entry.grab_focus();
     }
 
+    // Con el feature compilado, usamos layer-shell SOLO si el compositor lo
+    // soporta (niri, Hyprland, Sway...). En GNOME/KDE/X11 no existe el
+    // protocolo, así que caemos a una ventana normal en vez de crashear.
     #[cfg(feature = "layer-shell")]
     fn setup_window(window: &gtk::ApplicationWindow) {
-        use gtk4_layer_shell::{Edge, Layer, LayerShell};
-        window.init_layer_shell();
-        window.set_layer(Layer::Overlay);
-        window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
+        if gtk4_layer_shell::is_supported() {
+            use gtk4_layer_shell::{Edge, Layer, LayerShell};
+            window.init_layer_shell();
+            window.set_layer(Layer::Overlay);
+            window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
+            // Sin esto la ventana conserva su tamaño máximo y no encoge al vaciar.
+            window.set_resizable(false);
 
-        // Anclado arriba y centrado horizontalmente (estilo Spotlight).
-        window.set_anchor(Edge::Top, true);
-        window.set_anchor(Edge::Left, false);
-        window.set_anchor(Edge::Right, false);
-        window.set_anchor(Edge::Bottom, false);
-        window.set_margin(Edge::Top, 180);
-        // No reservamos zona exclusiva: es un overlay flotante.
-        window.set_exclusive_zone(-1);
+            // Anclado arriba y centrado horizontalmente (estilo Spotlight).
+            window.set_anchor(Edge::Top, true);
+            window.set_anchor(Edge::Left, false);
+            window.set_anchor(Edge::Right, false);
+            window.set_anchor(Edge::Bottom, false);
+            window.set_margin(Edge::Top, 180);
+            // No reservamos zona exclusiva: es un overlay flotante.
+            window.set_exclusive_zone(-1);
+        } else {
+            Self::setup_normal_window(window);
+        }
     }
 
     #[cfg(not(feature = "layer-shell"))]
     fn setup_window(window: &gtk::ApplicationWindow) {
+        Self::setup_normal_window(window);
+    }
+
+    /// Ventana sin decoraciones, tamaño según contenido. El compositor la
+    /// posiciona (normalmente centrada). Usada fuera de wlroots/layer-shell.
+    fn setup_normal_window(window: &gtk::ApplicationWindow) {
         window.set_decorated(false);
         window.set_resizable(false);
-        
+
         if let Some(surface) = window.surface().and_then(|s| s.downcast::<gdk::Toplevel>().ok()) {
             surface.set_startup_id("com.leonardo.QuickFind");
         }
@@ -409,6 +618,10 @@ impl QuickFindWindow {
         scrolled: &gtk::ScrolledWindow,
         entries: &[DesktopEntry],
         query: String,
+        calc: Option<&str>,
+        clips: Option<&[ClipItem]>,
+        ts: Option<&crate::timestamp::TsResult>,
+        ts_active: bool,
         rows: &Rc<RefCell<Vec<gtk::Box>>>,
         web_row_ref: &Rc<RefCell<Option<gtk::Box>>>,
         selected: usize,
@@ -429,6 +642,65 @@ impl QuickFindWindow {
 
         // Hay algo escrito: mostramos el área de resultados que va creciendo.
         scrolled.set_visible(true);
+
+        // Modo historial del portapapeles.
+        if let Some(clips) = clips {
+            if clips.is_empty() {
+                let msg = if crate::clipboard::is_available() {
+                    "Historial del portapapeles vacío"
+                } else {
+                    "cliphist no está instalado o no está corriendo"
+                };
+                let label = gtk::Label::builder()
+                    .label(msg)
+                    .css_classes(vec!["empty-label".to_string()])
+                    .build();
+                container.append(&label);
+                return;
+            }
+            for (i, item) in clips.iter().enumerate() {
+                let row = Self::build_clip_row(item, i, selected);
+                container.append(&row);
+                rows.borrow_mut().push(row);
+            }
+            return;
+        }
+
+        // Modo conversión de timestamp: dos filas (UTC y local).
+        if ts_active {
+            match ts {
+                Some(r) => {
+                    let unit = if r.unit == "ms" { "milisegundos" } else { "segundos" };
+                    let hint = gtk::Label::builder()
+                        .label(&format!("Interpretado como {} · Enter para copiar", unit))
+                        .halign(gtk::Align::Start)
+                        .css_classes(vec!["ts-hint".to_string()])
+                        .build();
+                    container.append(&hint);
+
+                    let utc = Self::build_ts_row("UTC", &r.utc, 0, selected);
+                    let local = Self::build_ts_row("Local", &r.local, 1, selected);
+                    container.append(&utc);
+                    container.append(&local);
+                    rows.borrow_mut().push(utc);
+                    rows.borrow_mut().push(local);
+                }
+                None => {
+                    let label = gtk::Label::builder()
+                        .label("Timestamp inválido (epoch en segundos o ms)")
+                        .css_classes(vec!["empty-label".to_string()])
+                        .build();
+                    container.append(&label);
+                }
+            }
+            return;
+        }
+
+        // Resultado de una operación matemática.
+        if let Some(result) = calc {
+            container.append(&Self::build_calc_row(result));
+            return;
+        }
 
         for (i, entry) in entries.iter().enumerate() {
             let row = Self::build_app_row(entry, i, selected, show_icons, icon_size);
@@ -461,7 +733,7 @@ impl QuickFindWindow {
                 .pixel_size(icon_size)
                 .css_classes(vec!["result-icon".to_string()])
                 .build();
-            
+
             if entry.icon.contains('/') || entry.icon.ends_with(".png") || entry.icon.ends_with(".svg") {
                 icon.set_from_file(Some(&std::path::PathBuf::from(&entry.icon)));
             } else {
@@ -534,12 +806,165 @@ impl QuickFindWindow {
         row
     }
 
-    fn update_selection(rows: &Rc<RefCell<Vec<gtk::Box>>>, selected: usize) {
-        for (i, row) in rows.borrow().iter().enumerate() {
+    fn build_clip_row(item: &ClipItem, index: usize, selected: usize) -> gtk::Box {
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .css_classes(vec!["result-row".to_string()])
+            .build();
+
+        let icon = gtk::Image::builder()
+            .pixel_size(22)
+            .css_classes(vec!["result-icon".to_string()])
+            .icon_name("edit-paste-symbolic")
+            .valign(gtk::Align::Center)
+            .build();
+        row.append(&icon);
+
+        // Vista previa en una sola línea, recortada con elipsis.
+        let label = gtk::Label::builder()
+            .label(&item.preview)
+            .halign(gtk::Align::Start)
+            .css_classes(vec!["result-name".to_string()])
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
+            .max_width_chars(60)
+            .build();
+        row.append(&label);
+
+        if index < 9 {
+            let shortcut = gtk::Label::builder()
+                .label(&format!("⌘{}", index + 1))
+                .css_classes(vec!["result-shortcut".to_string()])
+                .valign(gtk::Align::Center)
+                .build();
+            row.append(&shortcut);
+        }
+
+        if index == selected {
+            row.add_css_class("selected");
+        }
+
+        row
+    }
+
+    fn build_ts_row(tag: &str, value: &str, index: usize, selected: usize) -> gtk::Box {
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .css_classes(vec!["result-row".to_string()])
+            .build();
+
+        let tag_label = gtk::Label::builder()
+            .label(tag)
+            .css_classes(vec!["ts-tag".to_string()])
+            .valign(gtk::Align::Center)
+            .width_request(60)
+            .xalign(0.0)
+            .build();
+        row.append(&tag_label);
+
+        let value_label = gtk::Label::builder()
+            .label(value)
+            .halign(gtk::Align::Start)
+            .css_classes(vec!["ts-value".to_string()])
+            .hexpand(true)
+            .build();
+        row.append(&value_label);
+
+        if index < 9 {
+            let shortcut = gtk::Label::builder()
+                .label(&format!("⌘{}", index + 1))
+                .css_classes(vec!["result-shortcut".to_string()])
+                .valign(gtk::Align::Center)
+                .build();
+            row.append(&shortcut);
+        }
+
+        if index == selected {
+            row.add_css_class("selected");
+        }
+
+        row
+    }
+
+    fn build_calc_row(result: &str) -> gtk::Box {
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .css_classes(vec!["calc-row".to_string()])
+            .build();
+
+        let icon = gtk::Image::builder()
+            .pixel_size(28)
+            .css_classes(vec!["result-icon".to_string()])
+            .icon_name("accessories-calculator-symbolic")
+            .valign(gtk::Align::Center)
+            .build();
+        row.append(&icon);
+
+        let value = gtk::Label::builder()
+            .label(&format!("= {}", result))
+            .halign(gtk::Align::Start)
+            .css_classes(vec!["calc-result".to_string()])
+            .hexpand(true)
+            .build();
+        row.append(&value);
+
+        let hint = gtk::Label::builder()
+            .label("Enter para copiar")
+            .css_classes(vec!["calc-hint".to_string()])
+            .valign(gtk::Align::Center)
+            .build();
+        row.append(&hint);
+
+        row
+    }
+
+    /// Fuerza la altura del ScrolledWindow al alto natural del contenido
+    /// (con tope de 420px). Evita que se quede "pegado" al tamaño de una
+    /// búsqueda anterior cuando esta tenía 0 o 1 resultados.
+    fn fit_scrolled(scrolled: &gtk::ScrolledWindow, container: &gtk::Box) {
+        if !scrolled.is_visible() {
+            return;
+        }
+        const MAX_H: i32 = 420;
+        let (_, natural, _, _) = container.measure(gtk::Orientation::Vertical, -1);
+        let h = natural.clamp(0, MAX_H);
+        scrolled.set_min_content_height(h);
+        scrolled.set_max_content_height(h);
+    }
+
+    fn update_selection(
+        rows: &Rc<RefCell<Vec<gtk::Box>>>,
+        selected: usize,
+        scrolled: &gtk::ScrolledWindow,
+    ) {
+        let rows = rows.borrow();
+        for (i, row) in rows.iter().enumerate() {
             if i == selected {
                 row.add_css_class("selected");
             } else {
                 row.remove_css_class("selected");
+            }
+        }
+
+        // Desplazamos el viewport para que la fila seleccionada quede visible.
+        if let Some(row) = rows.get(selected) {
+            if let Some(parent) = row.parent() {
+                if let Some(bounds) = row.compute_bounds(&parent) {
+                    let adj = scrolled.vadjustment();
+                    let top = bounds.y() as f64;
+                    let bottom = top + bounds.height() as f64;
+                    let page = adj.page_size();
+                    let value = adj.value();
+                    if top < value {
+                        adj.set_value(top);
+                    } else if bottom > value + page {
+                        adj.set_value(bottom - page);
+                    }
+                }
             }
         }
     }

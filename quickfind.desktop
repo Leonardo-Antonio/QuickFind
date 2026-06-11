@@ -6,4 +6,4 @@ Type=Application
 Terminal=false
 Categories=System;Utility;
 Keywords=launcher;spotlight;rofi;search;applications;
-Icon=system-search
+Icon=quickfind

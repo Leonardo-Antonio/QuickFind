@@ -31,7 +31,7 @@ impl AppLauncher {
         if cache.is_empty() {
             *cache = Self::scan_applications();
         }
-        
+
         AppLauncher {
             matcher: SkimMatcherV2::default(),
         }
@@ -59,7 +59,7 @@ impl AppLauncher {
                 let comment_score = entry.comment.as_ref()
                     .and_then(|c| self.matcher.fuzzy_match(c, query))
                     .unwrap_or(0);
-                
+
                 let total_score = name_score * 10 + generic_score * 3 + keyword_score * 2 + comment_score;
                 Some((entry.clone(), total_score))
             })
@@ -108,7 +108,7 @@ impl AppLauncher {
 
     fn parse_desktop_file(path: &Path) -> Option<DesktopEntry> {
         let content = fs::read_to_string(path).ok()?;
-        
+
         let mut in_desktop_entry = false;
         let mut name = None;
         let mut name_localized = None;
