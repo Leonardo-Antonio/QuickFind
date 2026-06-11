@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=QuickFind
+Comment=Fast application launcher
+Exec=quickfind
+Type=Application
+Terminal=false
+Categories=System;Utility;
+Keywords=launcher;spotlight;rofi;search;applications;
+Icon=system-search
